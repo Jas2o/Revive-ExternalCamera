@@ -1,3 +1,8 @@
+# Revive-ExternalCamera
+This is a mod of [LibreVR's Revive](https://github.com/LibreVR/Revive) that is aimed at using Oculus Mixed Reality Capture compatible games with LIV avatars.
+
+ReviveXR has not been adjusted yet. Will need to manually inject and use /legacy command-line argument.
+
 # Revive Compatibility Layer
 
 This is a compatibility layer between the Oculus SDK and OpenVR/OpenXR. It allows you to play Oculus-exclusive games on your HTC Vive or Valve Index.
