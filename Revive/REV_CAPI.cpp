@@ -18,6 +18,10 @@
 #include <thread>
 #include <assert.h>
 
+#include <iostream>
+#include <fstream>
+#include <string>
+
 #define REV_DEFAULT_TIMEOUT 10000
 
 unsigned int g_MinorVersion = OVR_MINOR_VERSION;
@@ -304,8 +308,8 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_GetSessionStatus(ovrSession session, ovrSessi
 	sessionStatus->DisplayLost = status.DisplayLost;
 	sessionStatus->ShouldQuit = status.ShouldQuit;
 	sessionStatus->ShouldRecenter = status.ShouldRecenter;
-	sessionStatus->HasInputFocus = status.HasInputFocus;
-	sessionStatus->OverlayPresent = status.OverlayPresent;
+	sessionStatus->HasInputFocus = 1;// status.HasInputFocus; //Makes moving LIV camera difficult due to Dance Central pausing.
+	sessionStatus->OverlayPresent = 0;// status.OverlayPresent;
 	if (g_MinorVersion > 20)
 		sessionStatus->DepthRequested = false;
 
@@ -477,6 +481,47 @@ OVR_PUBLIC_FUNCTION(ovrTrackerPose) ovr_GetTrackerPose(ovrSession session, unsig
 	tracker.LeveledPose.Position = matrix.GetTranslation();
 
 	return tracker;
+}
+
+OVR_PUBLIC_FUNCTION(ovrTrackerPose) ovr_GetGenericTrackerPose(ovrSession session, vr::TrackedDeviceIndex_t trackerPoseIndex)
+{
+    REV_TRACE(ovr_GetTrackerPose);
+
+    ovrTrackerPose tracker = { 0 };
+
+    if (!session)
+        return tracker;
+
+    // Get the device poses.
+    vr::TrackedDevicePose_t pose;
+    vr::VRCompositor()->GetLastPoseForTrackedDeviceIndex(trackerPoseIndex, &pose, nullptr);
+
+    // Set the flags
+    tracker.TrackerFlags = 0;
+    if (trackerPoseIndex != vr::k_unTrackedDeviceIndexInvalid)
+    {
+        if (vr::VRSystem()->IsTrackedDeviceConnected(trackerPoseIndex))
+            tracker.TrackerFlags |= ovrTracker_Connected;
+        if (pose.bPoseIsValid)
+            tracker.TrackerFlags |= ovrTracker_PoseTracked;
+    }
+
+    // Convert the pose
+    REV::Matrix4f matrix;
+    if (trackerPoseIndex != vr::k_unTrackedDeviceIndexInvalid && pose.bPoseIsValid)
+        matrix = REV::Matrix4f(pose.mDeviceToAbsoluteTracking);
+
+    OVR::Quatf quat = OVR::Quatf(matrix);
+    tracker.Pose.Orientation = quat;
+    tracker.Pose.Position = matrix.GetTranslation();
+
+    // Level the pose
+    float yaw;
+    quat.GetYawPitchRoll(&yaw, nullptr, nullptr);
+    tracker.LeveledPose.Orientation = OVR::Quatf(OVR::Axis_Y, yaw);
+    tracker.LeveledPose.Position = matrix.GetTranslation();
+
+    return tracker;
 }
 
 // Pre-1.7 input state
@@ -1214,10 +1259,103 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Lookup(const char* name, void** data)
 	return ovrError_ServiceError;
 }
 
+static const char External_Camera_FileName[] = "externalcamera.cfg";
+static struct __stat64 External_Camera_FileInfo;
+static time_t External_Camera_FileLast;
+float External_Camera_VFov = 45;
+bool External_Camera_Checked_Config = false;
+
 OVR_PUBLIC_FUNCTION(ovrResult) ovr_GetExternalCameras(ovrSession session, ovrExternalCamera* cameras, unsigned int* inoutCameraCount)
 {
-	// TODO: Support externalcamera.cfg used by the SteamVR Unity plugin
-	return ovrError_NoExternalCameraInfo;
+	vr::TrackedDeviceIndex_t livCam = 0;
+	for (vr::TrackedDeviceIndex_t idx = 0; idx < vr::k_unMaxTrackedDeviceCount; idx++)
+	{
+		auto trackedDeviceClass = vr::VRSystem()->GetTrackedDeviceClass(idx);
+
+		if (trackedDeviceClass == vr::TrackedDeviceClass::TrackedDeviceClass_GenericTracker)
+		{
+			uint32_t size = vr::VRSystem()->GetStringTrackedDeviceProperty(idx, vr::Prop_ControllerType_String, nullptr, 0);
+			std::vector<char> strdata(size);
+			vr::VRSystem()->GetStringTrackedDeviceProperty(idx, vr::Prop_ControllerType_String, strdata.data(), size);
+
+			if (strcmp(strdata.data(), "liv_virtualcamera") == 0)
+				livCam = idx;
+		}
+	}
+
+	if(!livCam)
+		return ovrError_NoExternalCameraInfo;
+
+	vr::VRControllerState_t state;
+	vr::TrackedDevicePose_t pose;
+	bool gotPose = vr::VRSystem()->GetControllerStateWithPose(vr::ETrackingUniverseOrigin::TrackingUniverseStanding, livCam, &state, 1, &pose);
+	if (!gotPose) {
+		//Used when an overlay is open
+		vr::VRCompositor()->GetLastPoseForTrackedDeviceIndex(livCam, &pose, NULL);
+	}
+
+	cameras->Name[0] = 'L';
+	ovrResult res = 0;
+	*inoutCameraCount = (unsigned int)1;
+
+	int camHeight = 1080;
+	int camWidth = 1920;
+
+	cameras->Intrinsics.ImageSensorPixelResolution.h = camHeight;
+	cameras->Intrinsics.ImageSensorPixelResolution.w = camWidth;
+	cameras->Intrinsics.VirtualNearPlaneDistanceMeters = 0.100000001;
+	cameras->Intrinsics.VirtualFarPlaneDistanceMeters = 1000;
+
+	if (External_Camera_Checked_Config) {
+		// Check if file has changed since it last existed
+		if (_stat64(External_Camera_FileName, &External_Camera_FileInfo) != 1 && External_Camera_FileLast != External_Camera_FileInfo.st_mtime) {
+			External_Camera_FileLast = External_Camera_FileInfo.st_mtime;
+			External_Camera_Checked_Config = false;
+		}
+	}
+
+	if (!External_Camera_Checked_Config) {
+		// Check file for first time or if it changed
+		External_Camera_VFov = 45;
+		External_Camera_Checked_Config = true;
+
+		// A lot of games don't update the camera FOV until a scene change, could take it out if it impacts performance.
+		std::ifstream cFile(External_Camera_FileName);
+		if (cFile.is_open())
+		{
+			std::string line;
+			while (std::getline(cFile, line))
+			{
+				line.erase(std::remove_if(line.begin(), line.end(), isspace), line.end());
+				if (line.empty())
+					continue;
+
+				auto delimiterPos = line.find("=");
+				auto name = line.substr(0, delimiterPos);
+				auto value = line.substr(delimiterPos + 1);
+
+				if (name == "fov")
+					External_Camera_VFov = std::stof(value);
+			}
+		}
+	}
+
+	float inputVFov = External_Camera_VFov;
+	float cameraAspect = (float)camWidth / camHeight;
+	float vFov = inputVFov * MATH_FLOAT_DEGREETORADFACTOR;
+	float hFov = atanf(tanf(vFov * 0.5f) * cameraAspect) * 2.0f;
+	
+	cameras->Intrinsics.FOVPort.UpTan = cameras->Intrinsics.FOVPort.DownTan = tanf(vFov * 0.5f);
+	cameras->Intrinsics.FOVPort.LeftTan = cameras->Intrinsics.FOVPort.RightTan = tanf(hFov * 0.5f);
+
+	cameras->Extrinsics.AttachedToDevice = ovrTrackedDevice_None;
+	cameras->Extrinsics.CameraStatusFlags = ovrCameraStatus_Calibrated;
+	
+	ovrTrackerPose pose2 = ovr_GetGenericTrackerPose(session, livCam);
+	cameras->Extrinsics.RelativePose.Orientation = pose2.Pose.Orientation;
+	cameras->Extrinsics.RelativePose.Position = pose2.Pose.Position;
+
+	return res;
 }
 
 OVR_PUBLIC_FUNCTION(ovrResult) ovr_SetExternalCameraProperties(ovrSession session, const char* name, const ovrCameraIntrinsics* const intrinsics, const ovrCameraExtrinsics* const extrinsics)
